@@ -29,9 +29,12 @@ bl_info = {
     "category": "Import-Export",
 }
 
+from contextlib import ExitStack
 import json
+import mmap
 import pathlib
 import struct
+import traceback
 
 import bpy
 import bmesh
@@ -47,6 +50,25 @@ from typing import Callable
 STRUCT_INDEX = struct.Struct('H')
 STRUCT_VEC2 = struct.Struct('ee')
 STRUCT_VEC3 = struct.Struct('fff')
+
+COMPONENT_TYPES = {
+    5120: 'b', # BYTE
+    5121: 'B', # UNSIGNED_BYTE
+    5122: 'h', # SHORT
+    5123: 'H', # UNSIGNED_SHORT
+    5125: 'I', # UNSIGNED_INT
+    5126: 'f' # FLOAT
+}
+
+TYPES = {
+    'SCALAR': 1,
+    'VEC2': 2,
+    'VEC3': 3,
+    'VEC4': 4,
+    'MAT2': 4,
+    'MAT3': 9,
+    'MAT4': 16
+}
 
 
 def sub_buffer_from_view(buffer, buffer_view) -> list:
@@ -77,14 +99,56 @@ def get_indices(accessor_indices, buffer_indices) -> list:
     ]
 
 
-def read_primitive(gltf, buffer, selected):
+def data_from_accessor(gltf, buffers, accessor):
+    buffer_view = gltf['bufferViews'][accessor['bufferView']]
+
+    try:
+        start = buffer_view['byteOffset']
+    except KeyError:
+        start = 0
+    try:
+        start += accessor['byteOffset']
+    except:
+        pass
+    length = buffer_view['byteLength']
+    try:
+        length -= accessor['byteOffset']
+    except:
+        pass
+
+    f = buffers[buffer_view['buffer']]
+    f.seek(start)
+    data = f[start:start + length]
+
+    assert len(data) == length, f'{accessor}\n{buffer_view}\n{len(data)}\n{length}'
+
+    elements = TYPES[accessor['type']]
+    typ = COMPONENT_TYPES[accessor['componentType']]
+    fmt = typ * elements
+
+    try:
+        stride = buffer_view['byteStride']
+    except KeyError:
+        stride = struct.calcsize(fmt)
+
+    ret = [struct.unpack_from(fmt, data, i * stride) for i in range(0, accessor['count'])]
+    if elements > 1:
+        return ret
+    else:
+        return [r[0] for r in ret]
+
+
+
+
+def read_primitive(gltf, buffers, selected):
     attributes = selected['attributes']
 
     accessor_pos = gltf['accessors'][attributes['POSITION']]
     accessor_texcoord_0 = gltf['accessors'][attributes['TEXCOORD_0']]
     accessor_texcoord_1 = gltf['accessors'][attributes['TEXCOORD_1']]
     accessor_indices = gltf['accessors'][selected['indices']]
-    buffer_view_indices = gltf['bufferViews'][accessor_indices['bufferView']]
+
+    '''buffer_view_indices = gltf['bufferViews'][accessor_indices['bufferView']]
     # TODO separate buffer views and buffers per accessor since they can
     #  potentially be different
     buffer_view_data = gltf['bufferViews'][accessor_pos['bufferView']]
@@ -108,7 +172,12 @@ def read_primitive(gltf, buffer, selected):
         for i in texcoord_0_starts]
     texcoord_1_values = [
         STRUCT_VEC2.unpack(buffer_data[i:i + STRUCT_VEC2.size])
-        for i in texcoord_1_starts]
+        for i in texcoord_1_starts]'''
+
+    pos_values = data_from_accessor(gltf, buffers, accessor_pos)
+    texcoord_0_values = data_from_accessor(gltf, buffers, accessor_texcoord_0)
+    texcoord_1_values = data_from_accessor(gltf, buffers, accessor_texcoord_1)
+    indices = data_from_accessor(gltf, buffers, accessor_indices)
 
     return indices, pos_values, texcoord_0_values, texcoord_1_values
 
@@ -128,18 +197,19 @@ def as_tris(indices, pos_values, texcoord_values):
     return pos_tris, texcoord_tris
 
 
-def fill_mesh_data(buffer, gltf, gltf_mesh, uv0, uv1, b_mesh, mat_mapping,
+def fill_mesh_data(buffers, gltf, gltf_mesh, uv0, uv1, b_mesh, mat_mapping,
                    report):
     idx_offset = 0
     primitives = gltf_mesh['primitives']
-    idx, pos, tc0, tc1 = read_primitive(gltf, buffer, primitives[0])
-
-    for p in pos:
-        # converting to blender z up world
-        b_mesh.verts.new((p[0], -p[2], p[1]))
-    b_mesh.verts.ensure_lookup_table()
 
     for prim_idx, primitive in enumerate(primitives[0:]):
+        idx, pos, tc0, tc1 = read_primitive(gltf, buffers, primitive)
+
+        for p in pos:
+            # converting to blender z up world
+            b_mesh.verts.new((p[0], -p[2], p[1]))
+        b_mesh.verts.ensure_lookup_table()
+
         # TODO handle Asobo primitives with different indices
         # see skipped exceptions on a320 model for example
         try:
@@ -162,30 +232,40 @@ def fill_mesh_data(buffer, gltf, gltf_mesh, uv0, uv1, b_mesh, mat_mapping,
         try:
             start_vertex = asobo_data['BaseVertexIndex']
         except KeyError:
-            start_vertex = 0
+            start_vertex = idx_offset
 
         tri_count = asobo_data['PrimitiveCount']
         for tri_i in range(tri_count):
             i = start_index + tri_i * 3
             face_indices = (
-                idx_offset + start_vertex + idx[i + 2],
-                idx_offset + start_vertex + idx[i + 1],
-                idx_offset + start_vertex + idx[i + 0],
+                start_vertex + idx[i + 2],
+                start_vertex + idx[i + 1],
+                start_vertex + idx[i + 0],
             )
-            face = b_mesh.faces.new((
-                b_mesh.verts[face_indices[0]],
-                b_mesh.verts[face_indices[1]],
-                b_mesh.verts[face_indices[2]],
-            ))
+            uv_indices = (
+                idx[i + 2],
+                idx[i + 1],
+                idx[i + 0],
+            )
+            try:
+                face = b_mesh.faces.new((
+                    b_mesh.verts[face_indices[0]],
+                    b_mesh.verts[face_indices[1]],
+                    b_mesh.verts[face_indices[2]],
+                ))
+            except ValueError as ex:
+                raise ValueError(prim_idx, tri_i, start_vertex, len(pos), len(b_mesh.verts), face_indices, idx[i + 2], idx[i + 1], idx[i + 0], ex)
             face.material_index = mat_index
             for i, loop in enumerate(face.loops):
-                u, v = tc0[face_indices[i]]
+                u, v = tc0[uv_indices[i]]
                 loop[uv0].uv = (u, 1 - v)
-                u, v = tc1[face_indices[i]]
+                u, v = tc1[uv_indices[i]]
                 loop[uv1].uv = (u, 1 - v)
 
+        idx_offset += len(pos)
 
-def create_meshes(buffer, gltf, materials, report):
+
+def create_meshes(buffers, gltf, materials, report):
     meshes = []
     for gltf_mesh in gltf['meshes']:
         bl_mesh = bpy.data.meshes.new(gltf_mesh['name'])
@@ -208,14 +288,17 @@ def create_meshes(buffer, gltf, materials, report):
         uv0 = b_mesh.loops.layers.uv.new()
         uv1 = b_mesh.loops.layers.uv.new()
 
-        try:
-            fill_mesh_data(buffer, gltf, gltf_mesh, uv0, uv1, b_mesh,
-                           mat_mapping,
-                           report)
-        except Exception:
-            mesh_name = gltf_mesh['name']
-            report({'ERROR'}, f'could not handle mesh "{mesh_name}"')
-            continue
+        if 'frost' not in gltf_mesh['name'].lower():
+            try:
+                fill_mesh_data(buffers, gltf, gltf_mesh, uv0, uv1, b_mesh,
+                            mat_mapping,
+                            report)
+            except Exception as ex:
+                mesh_name = gltf_mesh['name']
+                report({'ERROR'}, f'could not handle mesh "{mesh_name}"')
+                with open(r'C:\Users\mike\Desktop\lol.txt', 'a') as f:
+                    f.write(f'{mesh_name} {type(ex).__name__} occurred. Arguments:\r\n{ex.args!r}\r\n{traceback.format_exc()}')
+                continue
 
         b_mesh.to_mesh(bl_mesh)
         bl_mesh.update()
@@ -251,16 +334,16 @@ def create_objects(nodes, meshes):
 
 
 def load_gltf_file(gltf_file_name):
+    global buffer_files
     gltf_file_path = pathlib.Path(gltf_file_name)
-    bin_file_name = gltf_file_path.with_suffix('.bin')
+    buffer_files = []
 
     with open(gltf_file_path, 'r') as handle:
         gltf = json.load(handle)
 
-    with open(bin_file_name, 'rb') as handle:
-        buffer = handle.read()
+    buffer_paths = [gltf_file_path.parent.joinpath(b['uri']) for b in gltf['buffers']]
 
-    return gltf, buffer
+    return gltf, buffer_paths
 
 
 def get_image_paths(gltf, texture_path: pathlib.Path, report: Callable):
@@ -333,7 +416,7 @@ def setup_object_hierarchy(bl_objects, gltf, collection):
 
 
 def import_msfs_gltf(context, gltf_file: str, texture_folder_name: str, report: Callable):
-    gltf, buffer = load_gltf_file(gltf_file)
+    gltf, buffer_paths = load_gltf_file(gltf_file)
 
     # if texture folder is not an absolute path, we assume standard SimObject heirachy
     texture_path = pathlib.Path(texture_folder_name)
@@ -342,7 +425,10 @@ def import_msfs_gltf(context, gltf_file: str, texture_folder_name: str, report: 
         texture_path = gltf_path.parent.parent.joinpath(texture_path)
 
     materials = create_materials(gltf, texture_path, report)
-    meshes = create_meshes(buffer, gltf, materials, report)
+    with ExitStack() as stack:
+        buffer_files = [stack.enter_context(p.open('rb')) for p in buffer_paths]
+        buffers = [mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) for f in buffer_files]
+        meshes = create_meshes(buffers, gltf, materials, report)
     objects = create_objects(gltf['nodes'], meshes)
     setup_object_hierarchy(objects, gltf, context.collection)
 
