@@ -29,7 +29,9 @@ bl_info = {
     "category": "Import-Export",
 }
 
+from contextlib import ExitStack
 import json
+import mmap
 import pathlib
 import struct
 
@@ -42,71 +44,76 @@ from bpy.types import Operator
 
 from typing import Callable
 
-STRUCT_INDEX = struct.Struct('H')
-STRUCT_VEC2 = struct.Struct('ee')
-STRUCT_VEC3 = struct.Struct('fff')
+
+COMPONENT_TYPES = {
+    5120: 'b', # BYTE
+    5121: 'B', # UNSIGNED_BYTE
+    5122: 'h', # SHORT
+    5123: 'H', # UNSIGNED_SHORT
+    5125: 'I', # UNSIGNED_INT
+    5126: 'f' # FLOAT
+}
+
+TYPES = {
+    'SCALAR': 1,
+    'VEC2': 2,
+    'VEC3': 3,
+    'VEC4': 4,
+    'MAT2': 4,
+    'MAT3': 9,
+    'MAT4': 16
+}
 
 
-def sub_buffer_from_view(buffer, buffer_view) -> list:
-    start = buffer_view['byteOffset']
-    end = start + buffer_view['byteLength']
-    return buffer[start:end]
+def data_from_accessor(gltf, buffers, accessor):
+    buffer_view = gltf['bufferViews'][accessor['bufferView']]
 
-
-def get_start_indices(accessor, stride) -> list:
     try:
-        start = accessor['byteOffset']
+        bv_offset = buffer_view['byteOffset']
     except KeyError:
-        start = 0
-    count = accessor['count']
-    end = start + count * stride
-    return [i for i in range(start, end, stride)]
-
-
-def get_indices(accessor_indices, buffer_indices) -> list:
+        bv_offset = 0
     try:
-        start = accessor_indices['byteOffset']
+        accessor_offset = accessor['byteOffset']
+    except:
+        accessor_offset = 0
+
+    start = bv_offset + accessor_offset
+    length = buffer_view['byteLength'] - accessor_offset
+
+    f = buffers[buffer_view['buffer']]
+    data = f[start:start + length]
+
+    assert len(data) == length, f'{accessor}\n{buffer_view}\n{len(data)}\n{length}'
+
+    elements = TYPES[accessor['type']]
+    typ = COMPONENT_TYPES[accessor['componentType']]
+    fmt = typ * elements
+
+    try:
+        stride = buffer_view['byteStride']
     except KeyError:
-        start = 0
-    end = start + accessor_indices['count'] * STRUCT_INDEX.size
-    return [
-        STRUCT_INDEX.unpack(buffer_indices[i:i + STRUCT_INDEX.size])[0]
-        for i in range(start, end, STRUCT_INDEX.size)
-    ]
+        stride = struct.calcsize(fmt)
+
+    ret = [struct.unpack_from(fmt, data, i * stride) for i in range(0, accessor['count'])]
+    if elements > 1:
+        return ret
+    else:
+        return [r[0] for r in ret]
 
 
-def read_primitive(gltf, buffer, selected):
+
+def read_primitive(gltf, buffers, selected):
     attributes = selected['attributes']
 
     accessor_pos = gltf['accessors'][attributes['POSITION']]
     accessor_texcoord_0 = gltf['accessors'][attributes['TEXCOORD_0']]
     accessor_texcoord_1 = gltf['accessors'][attributes['TEXCOORD_1']]
     accessor_indices = gltf['accessors'][selected['indices']]
-    buffer_view_indices = gltf['bufferViews'][accessor_indices['bufferView']]
-    # TODO separate buffer views and buffers per accessor since they can
-    #  potentially be different
-    buffer_view_data = gltf['bufferViews'][accessor_pos['bufferView']]
-    buffer_indices = sub_buffer_from_view(buffer, buffer_view_indices)
-    buffer_data = sub_buffer_from_view(buffer, buffer_view_data)
 
-    indices = get_indices(accessor_indices, buffer_indices)
-
-    pos_starts = get_start_indices(
-        accessor_pos, buffer_view_data['byteStride'])
-    texcoord_0_starts = get_start_indices(
-        accessor_texcoord_0, buffer_view_data['byteStride'])
-    texcoord_1_starts = get_start_indices(
-        accessor_texcoord_1, buffer_view_data['byteStride'])
-
-    pos_values = [
-        STRUCT_VEC3.unpack(buffer_data[i:i + STRUCT_VEC3.size])
-        for i in pos_starts]
-    texcoord_0_values = [
-        STRUCT_VEC2.unpack(buffer_data[i:i + STRUCT_VEC2.size])
-        for i in texcoord_0_starts]
-    texcoord_1_values = [
-        STRUCT_VEC2.unpack(buffer_data[i:i + STRUCT_VEC2.size])
-        for i in texcoord_1_starts]
+    pos_values = data_from_accessor(gltf, buffers, accessor_pos)
+    texcoord_0_values = data_from_accessor(gltf, buffers, accessor_texcoord_0)
+    texcoord_1_values = data_from_accessor(gltf, buffers, accessor_texcoord_1)
+    indices = data_from_accessor(gltf, buffers, accessor_indices)
 
     return indices, pos_values, texcoord_0_values, texcoord_1_values
 
@@ -126,13 +133,13 @@ def as_tris(indices, pos_values, texcoord_values):
     return pos_tris, texcoord_tris
 
 
-def fill_mesh_data(buffer, gltf, gltf_mesh, uv0, uv1, b_mesh, mat_mapping,
+def fill_mesh_data(buffers, gltf, gltf_mesh, uv0, uv1, b_mesh, mat_mapping,
                    report):
     idx_offset = 0
     primitives = gltf_mesh['primitives']
 
     for prim_idx, primitive in enumerate(primitives[0:]):
-        idx, pos, tc0, tc1 = read_primitive(gltf, buffer, primitive)
+        idx, pos, tc0, tc1 = read_primitive(gltf, buffers, primitive)
 
         for p in pos:
             # converting to blender z up world
@@ -184,7 +191,7 @@ def fill_mesh_data(buffer, gltf, gltf_mesh, uv0, uv1, b_mesh, mat_mapping,
         idx_offset += len(pos)
 
 
-def create_meshes(buffer, gltf, materials, report):
+def create_meshes(buffers, gltf, materials, report):
     meshes = []
     for gltf_mesh in gltf['meshes']:
         bl_mesh = bpy.data.meshes.new(gltf_mesh['name'])
@@ -208,7 +215,7 @@ def create_meshes(buffer, gltf, materials, report):
         uv1 = b_mesh.loops.layers.uv.new()
 
         try:
-            fill_mesh_data(buffer, gltf, gltf_mesh, uv0, uv1, b_mesh,
+            fill_mesh_data(buffers, gltf, gltf_mesh, uv0, uv1, b_mesh,
                            mat_mapping,
                            report)
         except Exception:
@@ -251,15 +258,14 @@ def create_objects(nodes, meshes):
 
 def load_gltf_file(gltf_file_name):
     gltf_file_path = pathlib.Path(gltf_file_name)
-    bin_file_name = gltf_file_path.with_suffix('.bin')
+    buffer_files = []
 
     with open(gltf_file_path, 'r') as handle:
         gltf = json.load(handle)
 
-    with open(bin_file_name, 'rb') as handle:
-        buffer = handle.read()
+    buffer_paths = [gltf_file_path.parent.joinpath(b['uri']) for b in gltf['buffers']]
 
-    return gltf, buffer
+    return gltf, buffer_paths
 
 
 def create_materials(gltf):
@@ -296,10 +302,13 @@ def setup_object_hierarchy(bl_objects, gltf, collection):
 
 
 def import_msfs_gltf(context, gltf_file: str, report: Callable):
-    gltf, buffer = load_gltf_file(gltf_file)
+    gltf, buffer_paths = load_gltf_file(gltf_file)
 
     materials = create_materials(gltf)
-    meshes = create_meshes(buffer, gltf, materials, report)
+    with ExitStack() as stack:
+        buffer_files = [stack.enter_context(p.open('rb')) for p in buffer_paths]
+        buffers = [mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) for f in buffer_files]
+        meshes = create_meshes(buffers, gltf, materials, report)
     objects = create_objects(gltf['nodes'], meshes)
     setup_object_hierarchy(objects, gltf, context.collection)
 
